@@ -125,17 +125,43 @@ function getBusinessRestrictionMessage(defaultMessage) {
 }
 
 function isBusinessScopedApiResponse(response) {
-  const responseText = (response && response.responseText ? response.responseText : "").toLowerCase();
-  return responseText.includes("business") || responseText.includes("enterprise");
+  if (!response || (response.status !== 401 && response.status !== 403)) {
+    return false;
+  }
+
+  let message = "";
+  if (response.responseJSON) {
+    message = `${response.responseJSON.detail || ""} ${response.responseJSON.message || ""} ${response.responseJSON.error || ""}`;
+  } else if (response.responseText) {
+    try {
+      const parsedResponse = JSON.parse(response.responseText);
+      message = `${parsedResponse.detail || ""} ${parsedResponse.message || ""} ${parsedResponse.error || ""}`;
+    } catch (error) {
+      message = "";
+    }
+  }
+
+  const normalizedMessage = message.toLowerCase();
+  return normalizedMessage.includes("udemy business") || normalizedMessage.includes("enterprise");
 }
 
-function persistLoginSession(accessToken, incomingSubdomain, explicitBusiness) {
+function getLoginErrorMessage(response) {
+  if (!isBusinessAccount() && isBusinessScopedApiResponse(response)) {
+    return `${translate("Invalid Access Token")} ${translate("This token appears to belong to Udemy Business. Enable Udemy Business and provide your subdomain.")}`;
+  }
+  if (isBusinessAccount()) {
+    return `${translate("Invalid Access Token")} ${translate("Please verify your Udemy Business subdomain and token.")}`;
+  }
+  return translate("Invalid Access Token");
+}
+
+function persistLoginSession(accessToken, incomingSubdomain, businessAccountFlag) {
   const token = normalizeAccessToken(accessToken);
   const normalizedSubdomain = normalizeSubdomain(incomingSubdomain || settings.get("subdomain"));
-  const businessFromInput = typeof explicitBusiness === "boolean"
-    ? explicitBusiness
+  const requestedBusinessAccount = typeof businessAccountFlag === "boolean"
+    ? businessAccountFlag
     : isBusinessSubdomain(normalizedSubdomain);
-  const finalBusiness = businessFromInput && normalizedSubdomain !== "www";
+  const finalBusiness = requestedBusinessAccount && isBusinessSubdomain(normalizedSubdomain);
   const finalSubdomain = finalBusiness ? normalizedSubdomain : "www";
 
   settings.set("access_token", token);
@@ -1577,10 +1603,10 @@ function validURL(value) {
 }
 
 function search(keyword, headers) {
-  const encodedKeyword = encodeURIComponent(keyword || "");
+  const encodedSearchQuery = encodeURIComponent(keyword || "");
   $.ajax({
     type: "GET",
-    url: buildUdemyApiUrl(`users/me/subscribed-courses?page_size=50&page=1&fields[user]=job_title&search=${encodedKeyword}`),
+    url: buildUdemyApiUrl(`users/me/subscribed-courses?page_size=50&page=1&fields[user]=job_title&search=${encodedSearchQuery}`),
     beforeSend: function () {
       $(".ui.dashboard .courses.dimmer").addClass("active");
     },
@@ -1635,8 +1661,9 @@ function askforSubtile(availableSubs, initDownload, $course, coursedata) {
 
 function loginWithUdemy() {
   if ($(".ui.login #business").is(":checked")) {
-    const normalizedBusinessSubdomain = normalizeSubdomain($subDomain.val());
-    if ($subDomain.val() == "") {
+    const rawBusinessSubdomain = $subDomain.val();
+    const normalizedBusinessSubdomain = normalizeSubdomain(rawBusinessSubdomain);
+    if (!rawBusinessSubdomain) {
       prompt.alert(translate("Please enter your business name"));
       return;
     }
@@ -1720,12 +1747,7 @@ function checkLogin() {
       error: function (response) {
         console.error("Login verification failed:", response);
         if (response.status == 403 || response.status == 401) {
-          const message = !isBusinessAccount() && isBusinessScopedApiResponse(response)
-            ? `${translate("Invalid Access Token")} ${translate("This token appears to belong to Udemy Business. Enable Udemy Business and provide your subdomain.")}`
-            : isBusinessAccount()
-              ? `${translate("Invalid Access Token")} ${translate("Please verify your Udemy Business subdomain and token.")}`
-              : translate("Invalid Access Token");
-          prompt.alert(message);
+          prompt.alert(getLoginErrorMessage(response));
           settings.set("access_token", false);
         }
         resetToLogin();
@@ -1736,16 +1758,17 @@ function checkLogin() {
 
 function loginWithAccessToken() {
   const businessSelected = $(".ui.login #business").is(":checked");
-  let normalizedBusinessSubdomain = "www";
+  let targetSubdomain = "www";
   if (
     businessSelected
   ) {
-    normalizedBusinessSubdomain = normalizeSubdomain($subDomain.val());
-    if (!$subDomain.val()) {
+    const rawBusinessSubdomain = $subDomain.val();
+    targetSubdomain = normalizeSubdomain(rawBusinessSubdomain);
+    if (!rawBusinessSubdomain) {
       prompt.alert(translate("Please enter your business name"));
       return;
     }
-    if (!validateBusinessSubdomain(normalizedBusinessSubdomain)) {
+    if (!validateBusinessSubdomain(targetSubdomain)) {
       prompt.alert(translate("Please enter a valid business subdomain (for example: your-company)"));
       return;
     }
@@ -1756,7 +1779,7 @@ function loginWithAccessToken() {
         prompt.alert(translate("Invalid Access Token format"));
         return;
       }
-      persistLoginSession(access_token, businessSelected ? normalizedBusinessSubdomain : "www", businessSelected);
+      persistLoginSession(access_token, businessSelected ? targetSubdomain : "www", businessSelected);
       checkLogin();
     }
   });
