@@ -37,8 +37,7 @@ io.on("connect", function (socket) {
 
   socket.on("newLogin", function (data) {
     if (awaitingLogin) {
-      settings.set("access_token", data.access_token);
-      settings.set("subdomain", data.subdomain);
+      persistLoginSession(data.access_token, data.subdomain);
       checkLogin();
     }
   });
@@ -48,8 +47,7 @@ let loginWindow = null;
 
 electron.ipcRenderer.on("access-token", function (event, data) {
   if (loginWindow) {
-    settings.set("access_token", data.access_token);
-    settings.set("subdomain", data.subdomain);
+    persistLoginSession(data.access_token, data.subdomain);
     checkLogin();
     loginWindow.close();
   }
@@ -62,6 +60,105 @@ electron.ipcRenderer.on("saveDownloads", function () {
 var subDomain = settings.get("subdomain") || "www";
 
 var $subDomain = $(".ui.login #subdomain");
+
+function normalizeSubdomain(value) {
+  if (!value) return "www";
+  let normalized = value.toString().trim().toLowerCase();
+  normalized = normalized.replace(/^https?:\/\//, "");
+  normalized = normalized.replace(/\.udemy\.com.*$/, "");
+  normalized = normalized.split(".")[0];
+  normalized = normalized.replace(/[^a-z0-9-]/g, "");
+  return normalized || "www";
+}
+
+function isBusinessSubdomain(value) {
+  return normalizeSubdomain(value) !== "www";
+}
+
+function normalizeAccessToken(value) {
+  if (!value) return "";
+  return value
+    .toString()
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+}
+
+function isValidAccessTokenFormat(value) {
+  const token = normalizeAccessToken(value);
+  return token.length >= 20 && !/\s/.test(token);
+}
+
+function validateBusinessSubdomain(value) {
+  const normalized = normalizeSubdomain(value);
+  return normalized !== "www" && /^[a-z0-9-]+$/.test(normalized);
+}
+
+function getActiveSubdomain() {
+  const storedSubdomain = normalizeSubdomain(settings.get("subdomain"));
+  const isBusinessAccount = settings.get("isBusinessAccount") === true;
+  if (isBusinessAccount && storedSubdomain !== "www") {
+    return storedSubdomain;
+  }
+  return "www";
+}
+
+function isBusinessAccount() {
+  return getActiveSubdomain() !== "www";
+}
+
+function buildUdemyApiUrl(endpoint) {
+  const normalizedEndpoint = (endpoint || "").replace(/^\/+/, "");
+  const domain = getActiveSubdomain();
+  const url = `https://${domain}.udemy.com/api-2.0/${normalizedEndpoint}`;
+  if (isBusinessAccount()) {
+    console.log("[Udemy Business] API URL:", url);
+  }
+  return url;
+}
+
+function getBusinessRestrictionMessage(defaultMessage) {
+  if (isBusinessAccount()) {
+    return `${defaultMessage} This content may be restricted in Udemy Business.`;
+  }
+  return defaultMessage;
+}
+
+function isBusinessScopedApiResponse(response) {
+  const responseText = (response && response.responseText ? response.responseText : "").toLowerCase();
+  return responseText.includes("business") || responseText.includes("enterprise");
+}
+
+function persistLoginSession(accessToken, incomingSubdomain, explicitBusiness) {
+  const token = normalizeAccessToken(accessToken);
+  const normalizedSubdomain = normalizeSubdomain(incomingSubdomain || settings.get("subdomain"));
+  const businessFromInput = typeof explicitBusiness === "boolean"
+    ? explicitBusiness
+    : isBusinessSubdomain(normalizedSubdomain);
+  const finalBusiness = businessFromInput && normalizedSubdomain !== "www";
+  const finalSubdomain = finalBusiness ? normalizedSubdomain : "www";
+
+  settings.set("access_token", token);
+  settings.set("isBusinessAccount", finalBusiness);
+  settings.set("subdomain", finalSubdomain);
+  subDomain = finalSubdomain;
+
+  console.log("[Login] Session saved", {
+    isBusinessAccount: finalBusiness,
+    subdomain: finalSubdomain
+  });
+}
+
+function updateBusinessLoginFields() {
+  const selected = $(".ui.login #business").is(":checked");
+  if (selected) {
+    $subDomain.show();
+    $(".ui.login #business-help-text").show();
+  } else {
+    $subDomain.hide();
+    $(".ui.login #business-help-text").hide();
+  }
+}
 
 $(".ui.dropdown").dropdown();
 
@@ -86,12 +183,14 @@ var downloadTemplate = `
 `;
 
 $(".ui.login #business").change(function () {
-  if ($(this).is(":checked")) {
-    $subDomain.show();
-  } else {
-    $subDomain.hide();
-  }
+  updateBusinessLoginFields();
 });
+
+if (settings.get("isBusinessAccount") && normalizeSubdomain(settings.get("subdomain")) !== "www") {
+  $(".ui.login #business").prop("checked", true);
+  $subDomain.val(normalizeSubdomain(settings.get("subdomain")));
+}
+updateBusinessLoginFields();
 
 checkLogin();
 
@@ -193,7 +292,7 @@ function refreshCourses() {
 
   $.ajax({
     type: "GET",
-    url: `https://${settings.get("subdomain")}.udemy.com/api-2.0/users/me/subscribed-courses?page_size=50`,
+    url: buildUdemyApiUrl("users/me/subscribed-courses?page_size=50"),
     headers: headers,
     success: function (response) {
       $(".ui.dashboard .courses.dimmer").removeClass("active");
@@ -202,10 +301,14 @@ function refreshCourses() {
     error: function (response) {
       $(".ui.dashboard .courses.dimmer").removeClass("active");
       if (response.status == 403 || response.status == 401) {
-        prompt.alert(translate("Invalid Access Token"));
+        const message = isBusinessAccount()
+          ? `${translate("Invalid Access Token")} ${translate("Please verify your Udemy Business subdomain and token.")}`
+          : translate("Invalid Access Token");
+        prompt.alert(message);
         settings.set("access_token", false);
         resetToLogin();
       } else {
+        console.error("Failed to refresh courses response:", response);
         prompt.alert(translate("Failed to refresh courses"));
       }
     }
@@ -273,7 +376,7 @@ $('.main-content').on('click', '.course-item .download.button', function () {
 
 const getCourseLectures = (courseId) => {
   return new Promise((resolve, reject) => {
-    const apiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/courses/${courseId}/subscriber-curriculum-items/?curriculum_types=chapter,lecture,practice,quiz,role-play&page_size=200&fields[lecture]=title,object_index,is_published,sort_order,created,asset,supplementary_assets,is_free&fields[quiz]=title,object_index,is_published,sort_order,type&fields[practice]=title,object_index,is_published,sort_order&fields[chapter]=title,object_index,is_published,sort_order&fields[asset]=title,filename,asset_type,status,time_estimation,is_external,course_is_drmed,media_sources,download_urls&caching_intent=True`;
+    const apiUrl = buildUdemyApiUrl(`courses/${courseId}/subscriber-curriculum-items/?curriculum_types=chapter,lecture,practice,quiz,role-play&page_size=200&fields[lecture]=title,object_index,is_published,sort_order,created,asset,supplementary_assets,is_free&fields[quiz]=title,object_index,is_published,sort_order,type&fields[practice]=title,object_index,is_published,sort_order&fields[chapter]=title,object_index,is_published,sort_order&fields[asset]=title,filename,asset_type,status,time_estimation,is_external,course_is_drmed,media_sources,download_urls&caching_intent=True`);
 
     $.ajax({
       url: apiUrl,
@@ -508,7 +611,7 @@ $(document).on('click', '.download-video-btn', function () {
   });
 
   // First, check if this video is actually downloadable and not DRM protected
-  const checkApiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=asset_type,status,is_external,download_urls,stream_urls,external_url,course_is_drmed,media_sources`;
+  const checkApiUrl = buildUdemyApiUrl(`users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=asset_type,status,is_external,download_urls,stream_urls,external_url,course_is_drmed,media_sources`);
 
   $.ajax({
     url: checkApiUrl,
@@ -518,7 +621,8 @@ $(document).on('click', '.download-video-btn', function () {
       console.log('Video check response:', response);
 
       if (!response.asset) {
-        showToast('Video asset not found or not accessible.', 'error');
+        console.log('Missing asset response:', response);
+        showToast(getBusinessRestrictionMessage('Video asset not found or not accessible.'), 'error');
         button.text('Download').prop('disabled', false);
         return;
       }
@@ -526,7 +630,7 @@ $(document).on('click', '.download-video-btn', function () {
       // Check for DRM protection
       if (response.asset.course_is_drmed === true || (response.asset.media_sources && response.asset.media_sources.length > 0 && !response.asset.download_urls)) {
         console.error('Video is DRM protected and cannot be downloaded.');
-        showToast('This video is DRM protected and cannot be downloaded.', 'error');
+        showToast(getBusinessRestrictionMessage('This video is DRM protected and cannot be downloaded.'), 'error');
         button.text('DRM Protected').addClass('grey').prop('disabled', true);
         return;
       }
@@ -570,7 +674,7 @@ $(document).on('click', '.download-video-btn', function () {
           showToast('Download started.');
         } else {
           console.error('No download URL returned for lecture:', lectureId);
-          showToast('Could not get download URL. This video may not be available for download.', 'error');
+          showToast(getBusinessRestrictionMessage('Could not get download URL. This video may not be available for download.'), 'error');
           button.text('Download').prop('disabled', false);
         }
       }).catch(err => {
@@ -579,7 +683,7 @@ $(document).on('click', '.download-video-btn', function () {
         let errorMessage = 'Failed to get download URL.';
 
         if (err.status === 403 || err.status === 401) {
-          errorMessage = 'Access denied. Please check your login credentials.';
+          errorMessage = getBusinessRestrictionMessage('Access denied. Please check your login credentials.');
         } else if (err.status === 404) {
           errorMessage = 'Video not found. It may have been removed or is not available.';
         } else if (err.status >= 500) {
@@ -612,13 +716,14 @@ $(document).on('click', '.download-file-btn, .download-ebook-btn, .download-audi
   button.text('Starting...').prop('disabled', true);
 
   // Get file download URL
-  const apiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,download_urls,filename`;
+  const apiUrl = buildUdemyApiUrl(`users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,download_urls,filename`);
 
   $.ajax({
     url: apiUrl,
     type: 'GET',
     headers: headers,
     success: function (response) {
+      console.log('File download API response:', response);
       if (response.asset && response.asset.download_urls) {
         // Find the appropriate download URL based on asset type
         let downloadUrl = null;
@@ -642,16 +747,17 @@ $(document).on('click', '.download-file-btn, .download-ebook-btn, .download-audi
           });
           showToast('Download started.');
         } else {
-          showToast('No download URL available for this file.', 'error');
+          showToast(getBusinessRestrictionMessage('No download URL available for this file.'), 'error');
           button.text('Download').prop('disabled', false);
         }
       } else {
-        showToast('No download URL available for this file.', 'error');
+        showToast(getBusinessRestrictionMessage('No download URL available for this file.'), 'error');
         button.text('Download').prop('disabled', false);
       }
     },
     error: function (err) {
-      showToast('Failed to get download URL.', 'error');
+      console.error('File download API error:', err);
+      showToast(getBusinessRestrictionMessage('Failed to get download URL.'), 'error');
       button.text('Download').prop('disabled', false);
     }
   });
@@ -668,13 +774,14 @@ $(document).on('click', '.download-article-btn', function () {
   button.text('Downloading...').prop('disabled', true);
 
   // Fetch article content using the correct API endpoint
-  const apiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,asset_type,body,external_url,download_urls`;
+  const apiUrl = buildUdemyApiUrl(`users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,asset_type,body,external_url,download_urls`);
 
   $.ajax({
     url: apiUrl,
     type: 'GET',
     headers: headers,
     success: function (response) {
+      console.log('Article content API response:', response);
       if (response.asset && response.asset.body) {
         // Create a complete HTML document with the article content
         const htmlContent = `<!DOCTYPE html>
@@ -754,13 +861,13 @@ $(document).on('click', '.download-article-btn', function () {
 
         showToast('Article download started.');
       } else {
-        showToast('No content available for this article.', 'error');
+        showToast(getBusinessRestrictionMessage('No content available for this article.'), 'error');
       }
       button.text('Download Article').prop('disabled', false);
     },
     error: function (err) {
       console.error('Article download error:', err);
-      showToast('Failed to load article content.', 'error');
+      showToast(getBusinessRestrictionMessage('Failed to load article content.'), 'error');
       button.text('Download Article').prop('disabled', false);
     }
   });
@@ -775,7 +882,7 @@ $(document).on('click', '.view-content-btn', function () {
   button.text('Loading...').prop('disabled', true);
 
   // Try to get content details
-  const apiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,asset_type,body,external_url,download_urls`;
+  const apiUrl = buildUdemyApiUrl(`users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,asset_type,body,external_url,download_urls`);
 
   $.ajax({
     url: apiUrl,
@@ -783,6 +890,7 @@ $(document).on('click', '.view-content-btn', function () {
     headers: headers,
     success: function (response) {
       if (response.asset) {
+        console.log('View content API response:', response);
         let content = '';
         if (response.asset.body) {
           content = response.asset.body;
@@ -813,12 +921,13 @@ $(document).on('click', '.view-content-btn', function () {
           }
         });
       } else {
-        showToast('No content available.', 'error');
+        showToast(getBusinessRestrictionMessage('No content available.'), 'error');
       }
       button.text('View').prop('disabled', false);
     },
     error: function (err) {
-      showToast('Failed to load content.', 'error');
+      console.error('View content API error:', err);
+      showToast(getBusinessRestrictionMessage('Failed to load content.'), 'error');
       button.text('View').prop('disabled', false);
     }
   });
@@ -1468,9 +1577,10 @@ function validURL(value) {
 }
 
 function search(keyword, headers) {
+  const encodedKeyword = encodeURIComponent(keyword || "");
   $.ajax({
     type: "GET",
-    url: `https://${subDomain}.udemy.com/api-2.0/users/me/subscribed-courses?page_size=50&page=1&fields[user]=job_title&search=${keyword}`,
+    url: buildUdemyApiUrl(`users/me/subscribed-courses?page_size=50&page=1&fields[user]=job_title&search=${encodedKeyword}`),
     beforeSend: function () {
       $(".ui.dashboard .courses.dimmer").addClass("active");
     },
@@ -1525,11 +1635,17 @@ function askforSubtile(availableSubs, initDownload, $course, coursedata) {
 
 function loginWithUdemy() {
   if ($(".ui.login #business").is(":checked")) {
+    const normalizedBusinessSubdomain = normalizeSubdomain($subDomain.val());
     if ($subDomain.val() == "") {
       prompt.alert(translate("Please enter your business name"));
       return;
     }
-    subDomain = $subDomain.val();
+    if (!validateBusinessSubdomain(normalizedBusinessSubdomain)) {
+      prompt.alert(translate("Please enter a valid business subdomain (for example: your-company)"));
+      return;
+    }
+    subDomain = normalizedBusinessSubdomain;
+    $subDomain.val(normalizedBusinessSubdomain);
   } else {
     subDomain = "www";
   }
@@ -1582,22 +1698,34 @@ function checkLogin() {
     $(".bottom-nav .active").removeClass("active");
     $(".bottom-nav .courses-sidebar").addClass("active");
 
-    headers = { Authorization: `Bearer ${settings.get("access_token")}` };
+    const accessToken = normalizeAccessToken(settings.get("access_token"));
+    if (!isValidAccessTokenFormat(accessToken)) {
+      prompt.alert(translate("Invalid Access Token format"));
+      settings.set("access_token", false);
+      resetToLogin();
+      return;
+    }
+    headers = { Authorization: `Bearer ${accessToken}` };
     $.ajax({
       type: "GET",
-      url: `https://${settings.get(
-        "subdomain"
-      )}.udemy.com/api-2.0/users/me/subscribed-courses?page_size=50`,
+      url: buildUdemyApiUrl("users/me/subscribed-courses?page_size=50"),
       beforeSend: function () {
         $(".ui.dashboard .courses.dimmer").addClass("active");
       },
       headers: headers,
       success: function (response) {
+        settings.set("isBusinessAccount", isBusinessAccount());
         handleResponse(response);
       },
       error: function (response) {
+        console.error("Login verification failed:", response);
         if (response.status == 403 || response.status == 401) {
-          prompt.alert(translate("Invalid Access Token"));
+          const message = !isBusinessAccount() && isBusinessScopedApiResponse(response)
+            ? `${translate("Invalid Access Token")} ${translate("This token appears to belong to Udemy Business. Enable Udemy Business and provide your subdomain.")}`
+            : isBusinessAccount()
+              ? `${translate("Invalid Access Token")} ${translate("Please verify your Udemy Business subdomain and token.")}`
+              : translate("Invalid Access Token");
+          prompt.alert(message);
           settings.set("access_token", false);
         }
         resetToLogin();
@@ -1607,22 +1735,28 @@ function checkLogin() {
 }
 
 function loginWithAccessToken() {
+  const businessSelected = $(".ui.login #business").is(":checked");
+  let normalizedBusinessSubdomain = "www";
   if (
-    $(".ui.login #business").is(":checked")
+    businessSelected
   ) {
+    normalizedBusinessSubdomain = normalizeSubdomain($subDomain.val());
     if (!$subDomain.val()) {
       prompt.alert(translate("Please enter your business name"));
+      return;
+    }
+    if (!validateBusinessSubdomain(normalizedBusinessSubdomain)) {
+      prompt.alert(translate("Please enter a valid business subdomain (for example: your-company)"));
       return;
     }
   }
   prompt.prompt(translate("Access Token"), function (access_token) {
     if (access_token) {
-      settings.set("access_token", access_token);
-      if ($(".ui.login #business").is(":checked")) {
-        settings.set("subdomain", $subDomain.val());
-      } else {
-        settings.set("subdomain", 'www');
+      if (!isValidAccessTokenFormat(access_token)) {
+        prompt.alert(translate("Invalid Access Token format"));
+        return;
       }
+      persistLoginSession(access_token, businessSelected ? normalizedBusinessSubdomain : "www", businessSelected);
       checkLogin();
     }
   });
@@ -1662,7 +1796,7 @@ searchInput.addEventListener('input', function () {
 
 const getLectureDownloadUrl = (courseId, lectureId) => {
   return new Promise((resolve, reject) => {
-    const apiUrl = `https://${settings.get("subdomain") || 'www'}.udemy.com/api-2.0/users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,download_urls,external_url,stream_urls`;
+    const apiUrl = buildUdemyApiUrl(`users/me/subscribed-courses/${courseId}/lectures/${lectureId}/?fields[lecture]=asset&fields[asset]=@min,download_urls,external_url,stream_urls`);
 
     console.log('Fetching download URL for lecture:', lectureId, 'in course:', courseId);
     console.log('API URL:', apiUrl);
@@ -1764,6 +1898,9 @@ const getLectureDownloadUrl = (courseId, lectureId) => {
           console.error('Asset keys:', Object.keys(response.asset));
           if (response.asset.download_urls) {
             console.error('Download URLs keys:', Object.keys(response.asset.download_urls));
+          }
+          if (isBusinessAccount()) {
+            console.warn('Udemy Business restriction suspected: download_urls may be omitted for this lecture.');
           }
           resolve(null);
         }

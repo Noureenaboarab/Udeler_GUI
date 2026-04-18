@@ -118,6 +118,22 @@
           </div>
 
           <div class="row">
+              <div class="ten wide column left aligned">
+                <div class="ui checkbox">
+                  <input type="checkbox" id="business">
+                  <label>${translate("Udemy Business Account")}</label>
+                </div>
+              </div>
+          </div>
+
+          <div class="row">
+              <div class="ten wide column">
+                <input type="text" id="subdomain" style="display: none;" placeholder="${translate("Business subdomain (for example: your-company)")}">
+                <small id="business-help-text" style="display: none; color: #8a8a8a;">${translate("Use the subdomain part of your URL (your-company.udemy.com).")}</small>
+              </div>
+          </div>
+
+          <div class="row">
               <div class="ten wide column">
               <button class="ui fluid blue button" onclick="loginWithAccessToken()"><i class="key icon"></i>${translate("Login")}</button>
               </div>
